@@ -147,8 +147,14 @@ TRADE = {"AVGO", "MU", "NBIS", "CRWV", "SNDK"}
 LEADER_BLACKOUT = False              # followers are not pulled every second (too many requests) ...
 MIN_EDGE.update({"CRWV": 2.0, "NBIS": 2.0, "SNDK": 2.0})   # ... so they quote 2 ticks from value, out of the snipers' usual reach
 SOFT_CAP_NARROW, SOFT_CAP_WIDE = 30, 40
-TAKE_SIZE = 10
-TAKE_WALL_SIZE = 20
+TAKE_SIZE = 20
+TAKE_WALL_SIZE = 20                  # lots at the minimum edge; +20 lots per extra tick of edge (confidence sizing)
+JUMP_CAP = 60                        # a leader-jump trade may take a follower's inventory up to this
+REDUCE_EDGE = 0.5                    # the quote that REDUCES inventory may sit this close to our value (exit faster)
+REDUCE_ONLY_S = 180                  # last seconds: only quotes and takes that reduce inventory
+# Live books showed other teams pricing the followers off their leaders, away from the wall mid. A follower quote
+# that looks stale against the wall mid is usually informed, so followers are only taken after a leader jump.
+TAKE_EDGE = {"AMD": 1.0, "AVGO": 1.0}
 RECONCILE_POS_S, RECONCILE_ORD_S = 2.0, 10.0
 
 logging.getLogger("client").setLevel("ERROR")
@@ -525,8 +531,10 @@ class Bot:
         """-> (bid, bid_size, ask, ask_size) in ticks and lots."""
         pos, wb, wa, cap = self.pos[iid], b["wb"], b["wa"], self.soft_cap(iid)
         edge = MIN_EDGE.get(iid, max(MIN_EDGE_WIDE, (wa - wb) / 2 - 3) if self.wide[iid] else MIN_EDGE_NARROW)
-        ask = math.ceil(r + edge - 1e-9)                               # closest to fair we are willing to sell
-        bid = math.floor(r - edge + 1e-9)
+        edge_ask = min(edge, REDUCE_EDGE) if pos > 0 else edge         # the side that reduces inventory quotes tighter
+        edge_bid = min(edge, REDUCE_EDGE) if pos < 0 else edge
+        ask = math.ceil(r + edge_ask - 1e-9)                           # closest to fair we are willing to sell
+        bid = math.floor(r - edge_bid + 1e-9)
         if PENNY:                                                      # do not give away more edge than needed
             ask = max(ask, (b["oa"] if b["oa"] is not None else wa) - 1)
             bid = min(bid, (b["ob"] if b["ob"] is not None else wb) + 1)
@@ -587,10 +595,12 @@ class Bot:
             d = self.drift(iid, now)                                    # the leader jumped: trade the follower's catch-up
             if d >= LEAD_MIN_DRIFT and r - b["wa"] >= TAKE_EDGE_WALL:
                 rest = self.my[iid]["bid"]["vol"] if self.my[iid]["bid"] else 0
-                side, px, vol, own = "bid", b["wa"], min(TAKE_WALL_SIZE, cap - pos - rest), "ask"
+                want = TAKE_WALL_SIZE * (1 + int(r - b["wa"] - TAKE_EDGE_WALL))      # more edge, more lots
+                side, px, vol, own = "bid", b["wa"], min(want, max(cap, JUMP_CAP) - pos - rest), "ask"
             elif d <= -LEAD_MIN_DRIFT and b["wb"] - r >= TAKE_EDGE_WALL:
                 rest = self.my[iid]["ask"]["vol"] if self.my[iid]["ask"] else 0
-                side, px, vol, own = "ask", b["wb"], min(TAKE_WALL_SIZE, cap + pos - rest), "bid"
+                want = TAKE_WALL_SIZE * (1 + int(b["wb"] - r - TAKE_EDGE_WALL))
+                side, px, vol, own = "ask", b["wb"], min(want, max(cap, JUMP_CAP) + pos - rest), "bid"
             else:
                 return
             if vol >= 1:

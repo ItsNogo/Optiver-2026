@@ -42,7 +42,11 @@ from optibook.synchronous_client import Exchange
 
 # --------------------------------------------------------------------------- parameters
 POSITION_LIMIT = 100                 # exchange limit per instrument [challenge slides]
-SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 80   # passive fills and takes never push |position| above this
+SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 40   # passive fills and ordinary takes never push |position| above this
+LL_POS_CAP = 80                      # only a confident lead-lag take may build a position up to this
+# Confidence tiers for takes: edge in ticks versus our reservation price -> (lots per take, position cap)
+TAKE_TIERS = ((7.0, 80, 80), (4.0, 40, 80), (0.0, 20, 40))
+LL_CONFIRM_S = 0.3                   # a lead-lag signal must have persisted this long before we pay the wall for it
 HARD_CAP = 95                        # if |position| ever gets here: cut to half the soft cap with a bounded IOC
 QUOTE_SIZE = 20                      # the organizers' taker sends 20-lot orders
 MIN_SIZE = 2                         # do not bother quoting less than this
@@ -51,7 +55,7 @@ WALL_BIG, WALL_SMALL = 2500, 700     # innermost ladder level: >= 2500 lots (nar
 MIN_EDGE_NARROW = 0.5                # ticks between our quote and the inventory-adjusted fair value
 MIN_EDGE_WIDE = 2.0                  # wide stocks: at least this many ticks from the adjusted fair value
 PASSIVE_OFF = {"AVGO", "AMD", "NVDA"}   # no resting quotes here: the first live run lost on them (takes still allowed)
-REFILL_S = 1.5                       # after one of our quotes is filled, do not re-quote that side for this long
+REFILL_S = 3.0                       # after one of our quotes is filled, do not re-quote that side for this long
 # Lead-lag: the follower's walls copy the leader's move about 3 s later (corr ~0.94 on 3 s windows after the restart).
 # follower: (leader, follower ticks per leader tick)
 LEADS = {"NBIS": ("AVGO", 0.22), "CRWV": ("MU", 0.95), "SNDK": ("NVDA", 0.45)}
@@ -358,7 +362,11 @@ class Bot:
             if fa is None or fb is None:
                 continue
             pa, pb = self.ll_prev.get(b, (fa, fb))
-            d = self.debt[b] + beta * (fa - pa) - (fb - pb)
+            owed, moved = self.debt[b] + beta * (fa - pa), fb - pb
+            if abs(owed) >= LL_MIN and owed * moved > 0 and abs(moved) >= 0.5 * abs(owed):
+                d = 0.0                                   # the follower answered: signal spent
+            else:
+                d = owed - moved
             d -= math.copysign(min(abs(d), LL_LEAK * dt), d)
             d = max(-LL_CAP, min(LL_CAP, d))
             if abs(d) >= LL_MIN:
@@ -382,8 +390,14 @@ class Bot:
         p = self.pos[iid]
         if USE_PAIRS and iid in PAIR_WEIGHT and PAIR_WEIGHT[iid][0] in self.pos:
             p += PAIR_WEIGHT[iid][1] * self.pos[PAIR_WEIGHT[iid][0]]
-        x = max(-1.5, min(1.5, p / self.soft_cap(iid)))
-        return b["fair"] + self.debt.get(iid, 0.0) - (SKEW_LIN * x + SKEW_CUB * x ** 3)
+        x = p / self.soft_cap(iid)
+        if self.wide[iid]:                                # 20 lots -> 0.5 tick, 40 -> 1.5, 80 -> 5
+            x = max(-2.5, min(2.5, x))
+            skew = math.copysign(0.5 * abs(x) + x * x, x)
+        else:
+            x = max(-1.5, min(1.5, x))
+            skew = SKEW_LIN * x + SKEW_CUB * x ** 3
+        return b["fair"] + self.debt.get(iid, 0.0) - skew
 
     def targets(self, iid, b, r, reduce_only):
         """-> (bid, bid_size, ask, ask_size) in ticks and lots."""
@@ -436,12 +450,17 @@ class Bot:
         pos, cap = self.pos[iid], self.soft_cap(iid)
         need = TAKE_EDGE_WIDE if self.wide[iid] else TAKE_EDGE_NARROW
         tb, ta = b["tb"], b["ta"]
-        if iid in LEADS and not reduce_only:                            # follower: its wall is about to move
+        follower = iid in LEADS and not reduce_only
+        if follower and now - self.debt_since.get(iid, now) >= LL_CONFIRM_S:   # its wall is about to move
             if (not ta or r - ta[0] < need) and r - b["wa"] >= LL_WALL_EDGE:
                 ta = (b["wa"], LL_TAKE_SIZE)
             elif (not tb or tb[0] - r < need) and b["wb"] - r >= LL_WALL_EDGE:
                 tb = (b["wb"], LL_TAKE_SIZE)
-        big = LL_TAKE_SIZE if abs(self.debt.get(iid, 0.0)) >= 4 else TAKE_SIZE
+        e = max(tb[0] - r if tb else -99.0, r - ta[0] if ta else -99.0)  # edge of the best opportunity, in ticks
+        big, tier_cap = next((lots, pc) for lim, lots, pc in TAKE_TIERS if e >= lim) if e >= 0 else (TAKE_SIZE, cap)
+        signal = follower and abs(self.debt.get(iid, 0.0)) >= LL_MIN
+        cap = min(LL_POS_CAP, tier_cap) if signal else cap              # larger positions only on a live lead-lag signal
+        big = big if signal else TAKE_SIZE
         if tb and tb[0] - r >= need:                                    # someone bids above our value: sell to them
             resting = self.my[iid]["ask"]["vol"] if self.my[iid]["ask"] else 0
             vol = min(tb[1], big, max(0, pos if reduce_only else cap + pos - resting))
