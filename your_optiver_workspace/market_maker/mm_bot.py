@@ -42,27 +42,27 @@ from optibook.synchronous_client import Exchange
 
 # --------------------------------------------------------------------------- parameters
 POSITION_LIMIT = 100                 # exchange limit per instrument [challenge slides]
-SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 40   # passive fills and ordinary takes never push |position| above this
+SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 60   # passive fills and ordinary takes never push |position| above this
 LL_POS_CAP = 80                      # only a confident lead-lag take may build a position up to this
 # Confidence tiers for takes: edge in ticks versus our reservation price -> (lots per take, position cap)
 TAKE_TIERS = ((7.0, 80, 80), (4.0, 40, 80), (0.0, 20, 40))
 LL_CONFIRM_S = 0.3                   # a lead-lag signal must have persisted this long before we pay the wall for it
 HARD_CAP = 95                        # if |position| ever gets here: cut to half the soft cap with a bounded IOC
-QUOTE_SIZE = 20                      # the organizers' taker sends 20-lot orders
+QUOTE_SIZE = 30                      # the organizers' taker sends 20-lot orders
 MIN_SIZE = 2                         # do not bother quoting less than this
 
 WALL_BIG, WALL_SMALL = 2500, 700     # innermost ladder level: >= 2500 lots (narrow stocks) else >= 700 (wide stocks)
 MIN_EDGE_NARROW = 0.5                # ticks between our quote and the inventory-adjusted fair value
-MIN_EDGE_WIDE = 2.0                  # wide stocks: at least this many ticks from the adjusted fair value
+MIN_EDGE_WIDE = 1.5                  # wide stocks: at least this many ticks from the adjusted fair value
 PASSIVE_OFF = {"AVGO", "AMD", "NVDA"}   # no resting quotes here: the first live run lost on them (takes still allowed)
-REFILL_S = 3.0                       # after one of our quotes is filled, do not re-quote that side for this long
+REFILL_S = 1.5                       # after one of our quotes is filled, do not re-quote that side for this long
 # Lead-lag: the follower's walls copy the leader's move about 3 s later (corr ~0.94 on 3 s windows after the restart).
 # follower: (leader, follower ticks per leader tick)
 LEADS = {"NBIS": ("AVGO", 0.22), "CRWV": ("MU", 0.95), "SNDK": ("NVDA", 0.45)}
 LL_LEAK = 0.15                       # ticks per second by which an unpaid expected move fades
 LL_TIMEOUT = 7.0                     # seconds after which a move the follower still has not made is forgotten
 LL_MIN, LL_CAP = 1.5, 30.0           # expected move that counts as a signal / largest we believe, in ticks
-LL_WALL_EDGE = 2.0                   # take the follower's wall itself when the expected move beats it by this much
+LL_WALL_EDGE = 4.0                  # take the follower's wall itself when the expected move beats it by this much
 LL_TAKE_SIZE = 80                    # lots per take when the expected move is at least 4 ticks
 SKEW_LIN, SKEW_CUB = 1.0, 1.0        # reservation price = fair - (LIN*x + CUB*x^3) ticks, x = inventory / soft cap
 PENNY = True                         # improve the best competing quote by one tick when the minimum edge allows it
@@ -70,7 +70,7 @@ COMP_VOL = 5                         # a competing level only counts once this m
 TAKE = True                          # hit resting quotes that are on the wrong side of our reservation price
 TAKE_EDGE_NARROW, TAKE_EDGE_WIDE = 1.0, 2.0   # ...by at least this many ticks
 TAKE_SIZE = 20
-TAKE_COOLDOWN = 0.25                 # seconds between takes in one stock
+TAKE_COOLDOWN = 0.15                 # seconds between takes in one stock
 
 TICK_AWARE = True                    # pull narrow-stock quotes around the walls' one-second reprice instant
 TICK_PRE, TICK_POST = 0.12, 0.08     # seconds before / after the learned instant during which we do not rest quotes
@@ -403,8 +403,9 @@ class Bot:
         """-> (bid, bid_size, ask, ask_size) in ticks and lots."""
         pos, wb, wa, cap = self.pos[iid], b["wb"], b["wa"], self.soft_cap(iid)
         edge = MIN_EDGE_WIDE if self.wide[iid] else MIN_EDGE_NARROW
-        ask = math.ceil(r + edge - 1e-9)                               # closest to fair we are willing to sell
-        bid = math.floor(r - edge + 1e-9)
+        # the side that reduces our inventory needs no edge: getting out matters more than the last tick
+        ask = math.ceil(r + (0.0 if pos > 0 else edge) - 1e-9)         # closest to fair we are willing to sell
+        bid = math.floor(r - (0.0 if pos < 0 else edge) + 1e-9)
         no_ask, no_bid = ask > wa, bid < wb                            # our price would be behind the wall: do not quote
         now = time.time()
         if PENNY:                                                      # do not give away more edge than needed
