@@ -1,0 +1,79 @@
+{
+  "source": "HistoricalDataLoader",
+  "requested_start_utc": "2026-11-12T17:03:20.715896+00:00",
+  "requested_end_utc": "2026-11-12T17:33:20.715896+00:00",
+  "endpoint_errors": {},
+  "schemas": {
+    "trades": {
+      "rows": 8955,
+      "columns": [
+        "timestamp_ns",
+        "timestamp_str",
+        "instrument_id",
+        "price",
+        "volume",
+        "aggressor_side",
+        "buyer",
+        "seller",
+        "trade_id",
+        "exchange_started_at"
+      ],
+      "dtypes": {
+        "timestamp_ns": "int64",
+        "timestamp_str": "object",
+        "instrument_id": "object",
+        "price": "float64",
+        "volume": "int32",
+        "aggressor_side": "object",
+        "buyer": "object",
+        "seller": "object",
+        "trade_id": "int64",
+        "exchange_started_at": "object"
+      }
+    },
+    "pricebooks": {
+      "rows": 212509,
+      "columns": [
+        "timestamp_ns",
+        "timestamp_str",
+        "instrument_id",
+        "bids_json",
+        "asks_json",
+        "exchange_started_at"
+      ],
+      "dtypes": {
+        "timestamp_ns": "int64",
+        "timestamp_str": "object",
+        "instrument_id": "object",
+        "bids_json": "object",
+        "asks_json": "object",
+        "exchange_started_at": "object"
+      }
+    }
+  },
+  "quality": {
+    "raw_snapshots": 212509,
+    "invalid_snapshots": 13,
+    "duplicate_symbol_timestamp": 0
+  },
+  "split_70_percent_utc": "2026-11-12T17:23:24.281641640+00:00",
+  "observed_start_utc": "2026-11-12T17:03:20.954666844+00:00",
+  "observed_end_utc": "2026-11-12T17:31:59.993202268+00:00",
+  "analysis_settings": {
+    "grid_seconds": 1,
+    "max_book_age_seconds": 2.0,
+    "horizons_seconds": [
+      1,
+      5,
+      10,
+      30
+    ],
+    "assumed_latency_seconds": 1,
+    "assumed_fee_per_side_price_units": 0.0,
+    "fees_verified": false,
+    "minimum_observations_warning": 30,
+    "models_trained": false,
+    "orders_sent": 0,
+    "exchange_connection_opened": false
+  }
+}

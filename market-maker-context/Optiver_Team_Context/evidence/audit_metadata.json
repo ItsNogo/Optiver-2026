@@ -1,0 +1,33 @@
+{
+  "mode": "offline_only",
+  "exchange_connection_opened": false,
+  "orders_sent": 0,
+  "research_script_sha256": "3b83443f25c98cfcaf60155cb1adee73ddc38eec39a614fd3e9580d64c2891d7",
+  "original_screen_rows_reproduced": 384,
+  "compared_metrics": [
+    "n_nonoverlap",
+    "mean_crossing_edge",
+    "median_crossing_edge",
+    "mean_signed_mid_move",
+    "n_long",
+    "n_short"
+  ],
+  "quality": {
+    "raw_snapshots": 212509,
+    "invalid_snapshots": 13,
+    "duplicate_symbol_timestamp": 0
+  },
+  "sensitivity_rule": "obi_0.5",
+  "sensitivity_horizon_s": 5,
+  "sampling_offsets": 7,
+  "fixed_block_minutes": 5,
+  "fixed_block_count": 6,
+  "positive_outcome_numerical_tolerance": 1e-10,
+  "interpretation": "Exploratory sensitivity on existing data, not a new holdout or executable PnL.",
+  "buyer_null_fraction": 1.0,
+  "seller_null_fraction": 1.0,
+  "duplicate_trade_id_session_pairs": 0,
+  "exchange_session_ids": [
+    "2026-11-11T12:28:39.801042+00:00"
+  ]
+}

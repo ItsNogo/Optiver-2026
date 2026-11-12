@@ -1,0 +1,30 @@
+# Local environment and authentication
+.env
+.env.*
+!.env.example
+credentials*
+*credentials.json
+secrets/
+config.local.*
+.venv/
+venv/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Raw event records and runtime output stay local
+data/raw/
+data/cache/
+raw_*.csv*
+logs/
+runs/
+runtime/
+*.log
+*.pid
+*.lock
+
+# Intentional, reviewed derived summaries belong in evidence/

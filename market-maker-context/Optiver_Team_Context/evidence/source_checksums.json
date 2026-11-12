@@ -1,0 +1,57 @@
+{
+  "evidence_date": "2026-11-12",
+  "original_archive": {
+    "name": "diagnostico_optibook.zip",
+    "size_bytes": 3292496,
+    "sha256": "5fcde81f472ce0079c358349241c52c38076127564d4fd8c24d9786f3c99cab4"
+  },
+  "original_research_source_sha256": "70d015ff9dfa29aaf84e4125bb882e30d56b29d3938f5da4a51b222f08006f2d",
+  "english_research_source_sha256": "3b83443f25c98cfcaf60155cb1adee73ddc38eec39a614fd3e9580d64c2891d7",
+  "original_inputs": [
+    {
+      "name": "REPORT.md",
+      "size_bytes": 3805,
+      "sha256": "98d95f02e1c9fcd4ac067314029451c3cf677babdbada442c34ea1f556d3c964"
+    },
+    {
+      "name": "book_features_sample.csv",
+      "size_bytes": 130643,
+      "sha256": "210b7721e1425ba683a400ba96509fbfb9bd4f12024b93de84d2eb7a3b508273"
+    },
+    {
+      "name": "metadata.json",
+      "size_bytes": 1988,
+      "sha256": "4dbdfce182cefa199a955568fd21132de9c72fce14b45f532fc3923452600489"
+    },
+    {
+      "name": "raw_pricebooks.csv.gz",
+      "size_bytes": 3158330,
+      "sha256": "161bb4b6ac3dc5a7d471b0784f7a447890d4881ea69baa8d9cd14ac3612b140a"
+    },
+    {
+      "name": "raw_trades.csv.gz",
+      "size_bytes": 107583,
+      "sha256": "1d223b9c791bec1fdb39a6eac83fe561f1ae9c59f92206c43db764b8098aaaf4"
+    },
+    {
+      "name": "signal_screen.csv",
+      "size_bytes": 58405,
+      "sha256": "62a77306fba6f6be4bbdf4e817dae28643a52dfa436c339d19a066254db1c489"
+    },
+    {
+      "name": "summary.csv",
+      "size_bytes": 904,
+      "sha256": "6acde3ad50ae9b4777fc6b33e1b654d22bd4cb46b8d75c2b75045094afe52247"
+    }
+  ],
+  "translation_scope": "Explanatory strings and comments; analytical structure, identifiers, numerical formulas, defaults, CLI names and outputs preserved.",
+  "verification": {
+    "summary_rows": 8,
+    "signal_screen_rows": 384,
+    "feature_sample_rows": 1000,
+    "numerical_tolerance": 1e-12,
+    "exchange_connected": false,
+    "orders_sent": 0
+  },
+  "raw_companion_note": "Raw files and metadata preserved; REPORT.md translated into English; ZIP bytes therefore differ from original."
+}

@@ -1,0 +1,16 @@
+{
+  "status": "passed",
+  "date": "2026-11-12",
+  "research_scripts_compile": true,
+  "live_exchange_construction_or_order_calls_in_research_scripts": false,
+  "original_signal_rows_reproduced": 384,
+  "original_summary_rows": 8,
+  "original_feature_sample_rows": 1000,
+  "curated_tables_match_reproduced_audit_after_key_alignment": true,
+  "numeric_tolerance": 1e-12,
+  "source_materials_reviewed": "Event photos, supplied API/notebook/types, prior guide/dossier, original diagnostic raw and summary files.",
+  "limitations": "No live bot, passive execution, fees, terminal score, or profitable trading strategy verified.",
+  "local_markdown_links_checked": true,
+  "master_navigation_checked": true,
+  "all_20_reading_sources_present": true
+}
