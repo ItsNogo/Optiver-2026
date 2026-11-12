@@ -1,72 +1,88 @@
-"""mm_bot.py - wall-anchored flow-capture market maker for the 8 Optibook stocks.
+"""mm_bot.py - tick-clock market maker and stale-quote taker for the 8 Optibook stocks.
 
-Idea (from the extractor research, see bot_data/summary.txt):
-  * The organizers' wall bot rests 3000-lot levels on both sides of a hidden fair value.
-    Fair value = midpoint of those two walls. It behaves like a random walk.
-  * The organizers' taker bot sends uninformed 20-lot IOC orders about 23 times a minute per stock,
-    with a limit price spread evenly between the fair value and the far side of the opposite wall.
-    Anyone resting a quote inside the walls is paid the distance to fair by that flow.
-  * So: rest one bid and one ask inside the walls, one tick better than the best competing quote but
-    never closer to fair than a minimum edge; lean both quotes against inventory; take quotes that
-    other teams leave on the wrong side of fair; stay far below the 100-lot limit; finish flat.
+What the research on 4 hours of exchange history showed (bot_data/summary.txt plus follow-up analysis):
+  * The organizers' wall bot rests a ladder on each side of a hidden fair value: 3000/2000/1000 lots on
+    the five narrow stocks (AMD, AVGO, MU, NVDA, VRT), 1000/750/500 on the three wide ones (CRWV, NBIS,
+    SNDK). Fair value = midpoint of the two innermost ladder levels. It is a random walk.
+  * The walls only move on a fixed one-second clock, at the same phase every second per stock.
+    Quotes left resting across that instant are what gets picked off: fills within 100 ms of a wall
+    move lose about 2.7 ticks, fills more than 300 ms after one earn about 0.35 ticks.
+  * The organizers' taker sends uninformed 20-lot IOCs about 24 times a minute per stock and hits the
+    best quote. Other teams leave quotes on the wrong side of the new fair value after a move.
+
+So this bot:
+  1. rests one bid and one ask inside the walls: at the touch on narrow stocks, at least 2 ticks from
+     fair on wide stocks (where the edge is 1.5-3 ticks a lot);
+  2. learns each stock's clock phase and pulls its narrow-stock quotes just before the walls can move,
+     then re-quotes from the new walls;
+  3. takes resting quotes that sit a full tick (narrow) or two ticks (wide) on the wrong side of its
+     inventory-adjusted fair value;
+  4. leans every price against inventory, caps inventory far below the 100-lot limit, nets inventory
+     across the two correlated pairs, has a kill switch, and finishes flat.
 
 Run as a plain script (never in a notebook). Only ONE process per team may be connected.
 
     python mm_bot.py --minutes 20              # run for 20 minutes from now
     python mm_bot.py --end 20:20:00            # run until this UTC time (use this form after a restart)
-    python mm_bot.py --minutes 5 --only NVDA,AMD
+    python mm_bot.py --minutes 5 --only NBIS,CRWV,SNDK
 
 Logs: mm_fills.csv (every fill with its edge versus fair), mm_state.csv (PnL and positions every second).
 UNTESTED against the live exchange: tested only against a simulated exchange. Watch the first run.
 """
 import argparse
+import cmath
 import csv
 import logging
 import math
-import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from optibook.synchronous_client import Exchange
 
 # --------------------------------------------------------------------------- parameters
-POSITION_LIMIT = 100      # exchange limit per instrument [challenge slides]
-SOFT_CAP = 60             # passive fills can never take |position| above this
-HARD_CAP = 80             # if |position| ever gets here: cut to SOFT_CAP / 2 with a bounded IOC
-QUOTE_SIZE = 20           # the organizers' taker sends 20-lot orders
-MIN_SIZE = 2              # do not bother quoting less than this
+POSITION_LIMIT = 100                 # exchange limit per instrument [challenge slides]
+SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 60   # passive fills and takes never push |position| above this
+HARD_CAP = 80                        # if |position| ever gets here: cut to half the soft cap with a bounded IOC
+QUOTE_SIZE = 20                      # the organizers' taker sends 20-lot orders
+MIN_SIZE = 2                         # do not bother quoting less than this
 
-MIN_EDGE = 0.5            # ticks between our quote and the inventory-adjusted fair value (0.5 -> 1 tick on whole-tick fairs)
-SKEW_LIN, SKEW_CUB = 1.0, 1.0   # reservation price = fair - (LIN*x + CUB*x^3) ticks, x = position / SOFT_CAP
-PENNY = True              # improve the best competing quote by one tick when the minimum edge allows it
-COMP_VOL = 5              # a competing level only counts once this many lots rest at or better than it
-TAKE_EDGE = 1.0           # hit a resting quote that is at least this many ticks on the wrong side of our reservation price
-TAKE_SIZE = 20            # most lots taken with one IOC
-TAKE_COOLDOWN = 0.25      # seconds between takes in one stock
+WALL_BIG, WALL_SMALL = 2500, 700     # innermost ladder level: >= 2500 lots (narrow stocks) else >= 700 (wide stocks)
+MIN_EDGE_NARROW = 0.5                # ticks between our quote and the inventory-adjusted fair value
+MIN_EDGE_WIDE = 2.0                  # wide stocks: at least this, and at least wall_spread/2 - 3
+SKEW_LIN, SKEW_CUB = 1.0, 1.0        # reservation price = fair - (LIN*x + CUB*x^3) ticks, x = inventory / soft cap
+PENNY = True                         # improve the best competing quote by one tick when the minimum edge allows it
+COMP_VOL = 5                         # a competing level only counts once this many lots rest at or better than it
+TAKE = True                          # hit resting quotes that are on the wrong side of our reservation price
+TAKE_EDGE_NARROW, TAKE_EDGE_WIDE = 1.0, 2.0   # ...by at least this many ticks
+TAKE_SIZE = 20
+TAKE_COOLDOWN = 0.25                 # seconds between takes in one stock
 
-WALL_MIN = 2500           # a level with at least this many lots is an organizer wall (the 3000-lot level)
-MAX_WALL_SPREAD = 30      # ticks; wider than this is not a believable pair of walls
-MAX_JUMP = 12             # ticks; a fair-value jump larger than this must persist JUMP_CONFIRM_S before we believe it
+TICK_AWARE = True                    # pull narrow-stock quotes around the walls' one-second reprice instant
+TICK_PRE, TICK_POST = 0.12, 0.08     # seconds before / after the learned instant during which we do not rest quotes
+PHASE_MIN_SAMPLES, PHASE_MIN_R = 8, 0.6   # how sure we must be of a stock's clock phase before using it
+
+MAX_WALL_SPREAD = 30                 # ticks; wider than this is not a believable pair of walls
+MAX_JUMP = 12                        # ticks; a larger fair-value jump must persist JUMP_CONFIRM_S before we believe it
 JUMP_CONFIRM_S = 0.5
-WALL_GRACE_S = 0.4        # keep quotes this long while the walls are unreadable (they are refreshed every 1-3 s)
-VOL_PAUSE_TICKS = 4.0     # fair moved this much within VOL_WINDOW_S -> pull quotes in that stock for VOL_PAUSE_S
+WALL_GRACE_S = 0.4                   # keep quotes this long while the walls are unreadable
+VOL_PAUSE_TICKS = 4.0                # fair moved this much within VOL_WINDOW_S -> stand aside for VOL_PAUSE_S
 VOL_WINDOW_S, VOL_PAUSE_S = 2.0, 1.0
 
-LOOP_SLEEP = 0.1          # seconds between passes. AGENTS.md says 0.2 or more: raise to 0.2 if you see throttling
-ACTION_GAP = 0.04         # minimum seconds between two order actions (insert / delete), about 25 per second
-MIN_REQUOTE_S = 0.4       # a quote that is still acceptable is not moved more often than this (keeps queue position)
-RECONCILE_POS_S = 1.0     # re-read positions and cash from the exchange this often
-RECONCILE_ORD_S = 3.0     # re-read our resting orders per stock this often
+LOOP_SLEEP = 0.05                    # seconds between passes (book reads look local; raise to 0.2 if throttled)
+ACTION_GAP = 0.04                    # minimum seconds between two order actions: about 25 per second
+MIN_REQUOTE_S = 0.4                  # a quote that is still acceptable is not moved more often than this
+RECONCILE_POS_S = 1.0                # re-read positions and cash from the exchange this often
+RECONCILE_ORD_S = 3.0                # re-read our resting orders per stock this often
 
-REDUCE_ONLY_S = 120       # last seconds: only quotes that reduce inventory
-FLATTEN_S = 45            # last seconds: pull quotes and close positions with bounded IOCs
-CUT_SLIP = 2              # ticks through the wall a closing IOC may be priced
-MAX_LOSS = 1500.0         # PnL (at fair value) below minus this: flatten everything and stop quoting
-# Pairs whose fair values move together (5 s correlation): inventory in one counts toward the other.
-# weight = lots of own-stock risk carried by one lot of the partner. Set USE_PAIRS False to switch off.
+REDUCE_ONLY_S = 120                  # last seconds: only quotes and takes that reduce inventory
+FLATTEN_S = 45                       # last seconds: pull quotes and close positions with bounded IOCs
+CUT_SLIP = 2                         # ticks through the wall a closing IOC may be priced
+MAX_LOSS = 800.0                     # PnL since start (at fair value) below minus this: flatten everything and stop
+STALE_BOOK_S = 5.0                   # a book whose timestamp has not changed for this long is not trusted
+# Correlated pairs (30 s correlation ~0.9+): a share of the partner's inventory counts as our own for the skew.
 USE_PAIRS = True
-PAIR_WEIGHT = {"AVGO": ("NBIS", 0.4), "NBIS": ("AVGO", 0.4), "CRWV": ("MU", 0.4), "MU": ("CRWV", 0.4),
-               "NVDA": ("SNDK", 0.3), "SNDK": ("NVDA", 0.3)}
+PAIR_WEIGHT = {"AVGO": ("NBIS", 0.2), "NBIS": ("AVGO", 0.6), "CRWV": ("MU", 0.4), "MU": ("CRWV", 0.4)}
 
 logging.getLogger("client").setLevel("ERROR")
 
@@ -89,24 +105,32 @@ class Bot:
         inst = ex.get_tradable_instruments()
         self.tick = {i: v.tick_size for i, v in inst.items() if not only or i in only}
         self.iids = sorted(self.tick)
+        if not self.iids:
+            raise SystemExit("no tradable instruments match")
         self.pos = {i: 0 for i in self.iids}             # local view, corrected from the exchange every second
         self.cash = {i: 0.0 for i in self.iids}
         self.my = {i: {"bid": None, "ask": None} for i in self.iids}   # our resting order per side: {id, px, vol, t}
+        self.wide = {i: False for i in self.iids}        # True for the 1000-lot-wall stocks
         self.fair = {}                                   # last trusted fair value per stock, in ticks (x.5 possible)
-        self.fair_at = {}                                # when it was last confirmed
-        self.fair_hist = {i: [] for i in self.iids}      # (time, fair) for the volatility pause
-        self.jump = {}                                   # candidate fair after a large jump: (fair, first seen)
+        self.fair_at = {}
+        self.fair_hist = {i: deque() for i in self.iids}
+        self.jump = {}
+        self.chg = {i: deque(maxlen=30) for i in self.iids}   # fraction of the second at which fair changes were seen
+        self.phase = {}                                  # learned clock phase per stock (local clock, seconds mod 1)
         self.pause_until = {i: 0.0 for i in self.iids}
         self.walls_bad_since = {}
         self.last_take = {i: 0.0 for i in self.iids}
-        self.last_cut = {}                               # iid -> (time, position before)
+        self.last_cut = {}
+        self.last_force_pull = {}
         self.last_ord_recon = {i: 0.0 for i in self.iids}
         self.last_pos_recon = 0.0
         self.last_action = 0.0
         self.action_gap, self.loop_sleep = ACTION_GAP, LOOP_SLEEP
         self.halted = False
         self.pnl = self.peak = self.max_dd = 0.0
-        self.n_actions = self.n_fills = self.n_fail = 0
+        self.pnl0 = None
+        self.book_seen = {}                              # iid -> (book timestamp, local time it first appeared)
+        self.n_actions = self.n_fills = self.n_fail = self.n_takes = 0
         self.lots = 0
         self.edge_sum = 0.0
         self.max_pos = {i: 0 for i in self.iids}
@@ -115,7 +139,11 @@ class Bot:
         self.fills_f = open("mm_fills.csv", "a", newline="")
         self.state_f = open("mm_state.csv", "a", newline="")
         self.fills_w, self.state_w = csv.writer(self.fills_f), csv.writer(self.state_f)
+        self.fills_w.writerow(["utc", "instrument", "side", "price", "volume", "fair_ticks", "edge_ticks", "position", "trade_id"])
         self.state_w.writerow(["utc", "pnl", "max_drawdown"] + self.iids)
+
+    def soft_cap(self, iid):
+        return SOFT_CAP_WIDE if self.wide[iid] else SOFT_CAP_NARROW
 
     # ----------------------------------------------------------------- exchange calls
     def pace(self):
@@ -128,12 +156,12 @@ class Bot:
     def failed(self, what, reason):
         self.n_fail += 1
         reason = str(reason)
-        print(f"FAIL {what}: {reason}")
+        print(f"FAIL {what}: {reason}", flush=True)
         low = reason.lower()
         if any(k in low for k in ("rate", "throttl", "too many", "frequen")):      # back off when throttled
             self.action_gap = min(0.5, self.action_gap * 1.5)
             self.loop_sleep = min(1.0, max(0.2, self.loop_sleep * 1.5))
-            print(f"THROTTLED -> action gap {self.action_gap:.3f} s, loop sleep {self.loop_sleep:.2f} s")
+            print(f"THROTTLED -> action gap {self.action_gap:.3f} s, loop sleep {self.loop_sleep:.2f} s", flush=True)
 
     def insert(self, iid, px_t, vol, side, order_type="limit"):
         """Limit-aware insert. Returns the order id or None."""
@@ -150,7 +178,7 @@ class Bot:
         r = self.ex.insert_order(iid, price=to_price(px_t, self.tick[iid]), volume=vol, side=side, order_type=order_type)
         if not r.success:
             self.failed(f"insert {iid} {side} {vol}@{px_t}", r.error_reason)
-            self.last_ord_recon[iid] = 0.0                # force a re-read of our orders
+            self.last_ord_recon[iid] = 0.0                # force a re-read of our orders and positions
             self.last_pos_recon = 0.0
             return None
         if order_type == "limit":
@@ -163,10 +191,19 @@ class Bot:
             return
         self.pace()
         r = self.ex.delete_order(iid, order_id=o["id"])
-        self.my[iid][side] = None                         # gone either way: deleted, or already filled
-        if not r.success and "find" not in str(r.error_reason).lower():
+        if r.success or "find" in str(r.error_reason).lower():
+            self.my[iid][side] = None                     # deleted, or already gone (filled)
+        else:                                             # still resting as far as we know: keep it, re-read soon
             self.failed(f"delete {iid} {side}", r.error_reason)
             self.last_ord_recon[iid] = 0.0
+
+    def pull(self, iid):
+        """Remove both quotes of one stock with a single request."""
+        mine = self.my[iid]
+        if mine["bid"] or mine["ask"]:
+            self.pace()
+            self.ex.delete_orders(iid)                    # returns nothing; the periodic re-read confirms it
+            mine["bid"] = mine["ask"] = None
 
     def poll_fills(self, iid):
         for t in self.ex.poll_new_trades(iid):            # the only place this poll is called
@@ -178,8 +215,7 @@ class Bot:
                 if o["vol"] <= 0:
                     self.my[iid][t.side] = None
             f = self.fair.get(iid)
-            px_t = t.price / self.tick[iid]
-            edge = None if f is None else round(sign * (f - px_t), 2)   # ticks earned versus fair
+            edge = None if f is None else round(sign * (f - t.price / self.tick[iid]), 2)   # ticks earned versus fair
             self.n_fills += 1
             self.lots += t.volume
             self.edge_sum += (edge or 0.0) * t.volume
@@ -190,19 +226,21 @@ class Bot:
         for iid in self.iids:
             self.poll_fills(iid)                          # drain first so a fill is not counted twice
         pc = self.ex.get_positions_and_cash()
-        pnl = 0.0
+        total, complete = 0.0, True
         for iid in self.iids:
             if iid in pc:
                 self.pos[iid], self.cash[iid] = int(pc[iid]["volume"]), float(pc[iid]["cash"])
                 self.max_pos[iid] = max(self.max_pos[iid], abs(self.pos[iid]))
             f = self.fair.get(iid)
-            if f is not None:
-                pnl += self.cash[iid] + self.pos[iid] * f * self.tick[iid]
-            elif self.pos[iid] == 0:
-                pnl += self.cash[iid]
-        self.pnl = pnl
-        self.peak = max(self.peak, pnl)
-        self.max_dd = max(self.max_dd, self.peak - pnl)
+            if f is None and self.pos[iid] != 0:
+                complete = False                          # cannot value this position yet
+            total += self.cash[iid] + (self.pos[iid] * f * self.tick[iid] if f is not None else 0.0)
+        if complete:
+            if self.pnl0 is None:
+                self.pnl0 = total                         # PnL is reported relative to the moment the bot started
+            self.pnl = total - self.pnl0
+            self.peak = max(self.peak, self.pnl)
+            self.max_dd = max(self.max_dd, self.peak - self.pnl)
         self.last_pos_recon = time.time()
 
     def reconcile_orders(self, iid):
@@ -225,16 +263,32 @@ class Bot:
         book = self.ex.get_last_price_book(iid)
         if not book or not book.bids or not book.asks:
             return None
+        ts = getattr(book, "timestamp", None)
+        seen = self.book_seen.get(iid)
+        if seen is None or seen[0] != ts:
+            self.book_seen[iid] = (ts, now)
+        elif now - seen[1] > STALE_BOOK_S:
+            return None                                   # the feed for this stock has stalled
         tick, mine = self.tick[iid], self.my[iid]
+        big_b = next((k for k, lv in enumerate(book.bids) if lv.volume >= WALL_BIG), None)
+        big_a = next((k for k, lv in enumerate(book.asks) if lv.volume >= WALL_BIG), None)
+        if big_b is not None and big_a is not None:
+            kb, ka, wide = big_b, big_a, False
+        else:                                             # 1000/750/500 ladder: the wide stocks
+            kb = next((k for k, lv in enumerate(book.bids) if lv.volume >= WALL_SMALL), None)
+            ka = next((k for k, lv in enumerate(book.asks) if lv.volume >= WALL_SMALL), None)
+            wide = True
+        if kb is None or ka is None:
+            return None
+        wb, wa = to_ticks(book.bids[kb].price, tick), to_ticks(book.asks[ka].price, tick)
+        if not 2 <= wa - wb <= MAX_WALL_SPREAD:
+            return None
 
-        def scan(levels, own):
-            wall = best = top = None
+        def inside(levels, k_wall, own):
+            best = top = None
             cum = 0
-            for lv in levels:
+            for lv in levels[:k_wall]:
                 pt = to_ticks(lv.price, tick)
-                if lv.volume >= WALL_MIN:
-                    wall = pt
-                    break
                 other = lv.volume - (own["vol"] if own and own["px"] == pt else 0)
                 if other > 0:
                     if top is None:
@@ -242,12 +296,10 @@ class Bot:
                     cum += other
                     if best is None and cum >= COMP_VOL:
                         best = pt                         # best competing level with real size
-            return wall, best, top
+            return best, top
 
-        wb, ob, tb = scan(book.bids, mine["bid"])
-        wa, oa, ta = scan(book.asks, mine["ask"])
-        if wb is None or wa is None or not 2 <= wa - wb <= MAX_WALL_SPREAD:
-            return None
+        ob, tb = inside(book.bids, kb, mine["bid"])
+        oa, ta = inside(book.asks, ka, mine["ask"])
         fair = (wb + wa) / 2
         last = self.fair.get(iid)
         if last is not None and abs(fair - last) > MAX_JUMP and now - self.fair_at.get(iid, 0) < 30:
@@ -258,61 +310,74 @@ class Bot:
             if now - cand[1] < JUMP_CONFIRM_S:
                 return None
         self.jump.pop(iid, None)
+        if last is not None and fair != last and abs(fair - last) <= MAX_JUMP:
+            self.learn_phase(iid, now)
+        self.wide[iid] = wide
         self.fair[iid], self.fair_at[iid] = fair, now
         hist = self.fair_hist[iid]
         hist.append((now, fair))
-        while hist and now - hist[0][0] > VOL_WINDOW_S:
-            hist.pop(0)
+        while now - hist[0][0] > VOL_WINDOW_S:
+            hist.popleft()
         if max(f for _, f in hist) - min(f for _, f in hist) >= VOL_PAUSE_TICKS:
             self.pause_until[iid] = now + VOL_PAUSE_S
         return {"fair": fair, "wb": wb, "wa": wa, "ob": ob, "oa": oa, "tb": tb, "ta": ta}
 
-    def eff_pos(self, iid):
-        """Inventory used for the skew: own position plus a share of the correlated partner's."""
-        p = self.pos[iid]
-        if USE_PAIRS and iid in PAIR_WEIGHT:
-            partner, w = PAIR_WEIGHT[iid]
-            if partner in self.pos:
-                p += w * self.pos[partner] * (self.fair.get(partner, 0) * self.tick.get(partner, 0)
-                                               / max(1e-9, self.fair.get(iid, 0) * self.tick[iid])
-                                               if self.fair.get(partner) and self.fair.get(iid) else 0)
-        return p
+    def learn_phase(self, iid, now):
+        """Fair-value changes arrive at a fixed fraction of each second; estimate it on our own clock."""
+        self.chg[iid].append(now % 1.0)
+        if len(self.chg[iid]) < PHASE_MIN_SAMPLES:
+            return
+        z = sum(cmath.exp(2j * math.pi * f) for f in self.chg[iid]) / len(self.chg[iid])
+        if abs(z) >= PHASE_MIN_R:                          # tightly clustered: trust it
+            self.phase[iid] = (cmath.phase(z) / (2 * math.pi) - self.loop_sleep / 2) % 1.0
+        else:
+            self.phase.pop(iid, None)
 
-    def targets(self, iid, b, reduce_only):
-        """-> (bid, bid_size, ask, ask_size, reservation) in ticks and lots."""
-        pos, wb, wa = self.pos[iid], b["wb"], b["wa"]
-        x = max(-1.5, min(1.5, self.eff_pos(iid) / SOFT_CAP))
-        r = b["fair"] - (SKEW_LIN * x + SKEW_CUB * x ** 3)             # reservation price
-        ask = math.ceil(r + MIN_EDGE - 1e-9)                           # closest to fair we are willing to sell
-        bid = math.floor(r - MIN_EDGE + 1e-9)
+    def in_blackout(self, iid, now):
+        """True around the instant the walls of this (narrow) stock can move."""
+        if not TICK_AWARE or self.wide[iid] or iid not in self.phase:
+            return False
+        d = (now - self.phase[iid]) % 1.0                  # seconds since the last expected move
+        return d > 1.0 - max(TICK_PRE, self.loop_sleep + 0.08) or d < TICK_POST
+
+    def reservation(self, iid, b):
+        """Fair value leaned against our inventory (own position plus a share of the correlated partner's)."""
+        p = self.pos[iid]
+        if USE_PAIRS and iid in PAIR_WEIGHT and PAIR_WEIGHT[iid][0] in self.pos:
+            p += PAIR_WEIGHT[iid][1] * self.pos[PAIR_WEIGHT[iid][0]]
+        x = max(-1.5, min(1.5, p / self.soft_cap(iid)))
+        return b["fair"] - (SKEW_LIN * x + SKEW_CUB * x ** 3)
+
+    def targets(self, iid, b, r, reduce_only):
+        """-> (bid, bid_size, ask, ask_size) in ticks and lots."""
+        pos, wb, wa, cap = self.pos[iid], b["wb"], b["wa"], self.soft_cap(iid)
+        edge = max(MIN_EDGE_WIDE, (wa - wb) / 2 - 3) if self.wide[iid] else MIN_EDGE_NARROW
+        ask = math.ceil(r + edge - 1e-9)                               # closest to fair we are willing to sell
+        bid = math.floor(r - edge + 1e-9)
         if PENNY:                                                      # do not give away more edge than needed
             ask = max(ask, (b["oa"] if b["oa"] is not None else wa) - 1)
             bid = min(bid, (b["ob"] if b["ob"] is not None else wb) + 1)
-        ask = max(min(ask, wa), wb + 1)                                # never through the far wall, never past our own wall
+        ask = max(min(ask, wa), wb + 1)                                # stay between the walls
         bid = min(max(bid, wb), wa - 1)
-        if bid >= ask:                                                 # cannot happen with MIN_EDGE > 0; be safe
+        if bid >= ask:                                                 # cannot happen with a positive edge; be safe
             bid = ask - 1
-        bid_size = max(0, min(QUOTE_SIZE, SOFT_CAP - pos))
-        ask_size = max(0, min(QUOTE_SIZE, SOFT_CAP + pos))
+        bid_size = max(0, min(QUOTE_SIZE, cap - pos))
+        ask_size = max(0, min(QUOTE_SIZE, cap + pos))
         if reduce_only:
             bid_size, ask_size = min(bid_size, max(0, -pos)), min(ask_size, max(0, pos))
-        if bid_size < MIN_SIZE and not (reduce_only and bid_size > 0):
-            bid_size = 0
-        if ask_size < MIN_SIZE and not (reduce_only and ask_size > 0):
-            ask_size = 0
-        return bid, bid_size, ask, ask_size, r
+        elif bid_size < MIN_SIZE or ask_size < MIN_SIZE:
+            bid_size, ask_size = (0 if bid_size < MIN_SIZE else bid_size), (0 if ask_size < MIN_SIZE else ask_size)
+        return bid, bid_size, ask, ask_size
 
     # ----------------------------------------------------------------- actions
     def manage_side(self, iid, side, px, size, now, deletes, inserts):
         """Queue the delete / insert needed to make our order on `side` match (px, size)."""
         o = self.my[iid][side]
         if o:
-            ok_price = o["px"] == px
-            ok_size = size > 0 and min(size, MIN_SIZE) <= o["vol"] <= max(size, QUOTE_SIZE)
-            if ok_price and ok_size:
+            if o["px"] == px and size > 0 and size / 2 <= o["vol"] <= size:
                 return                                    # leave it: keeps its place in the queue
-            # urgent = our price is on the wrong side of what we now accept (stale after a fair move) or size must go to 0
-            urgent = size == 0 or (o["px"] > px if side == "bid" else o["px"] < px)
+            # urgent: resting more than we may now hold, or priced closer to fair than we accept (stale after a move)
+            urgent = size == 0 or o["vol"] > size or (o["px"] > px if side == "bid" else o["px"] < px)
             if not urgent and now - o["t"] < MIN_REQUOTE_S:
                 return
             deletes.append((0 if urgent else 1, iid, side))
@@ -320,23 +385,24 @@ class Bot:
             inserts.append((iid, side, px, size))
 
     def take(self, iid, b, r, now, reduce_only):
-        """Hit a resting quote that sits at least TAKE_EDGE ticks on the wrong side of our reservation price."""
-        if now - self.last_take[iid] < TAKE_COOLDOWN:
+        """Hit a resting quote that sits on the wrong side of our reservation price by the take edge."""
+        if not TAKE or now - self.last_take[iid] < TAKE_COOLDOWN:
             return
-        pos = self.pos[iid]
+        pos, cap = self.pos[iid], self.soft_cap(iid)
+        need = TAKE_EDGE_WIDE if self.wide[iid] else TAKE_EDGE_NARROW
         tb, ta = b["tb"], b["ta"]
-        if tb and tb[0] > b["wb"] and tb[0] - r >= TAKE_EDGE:           # someone bids above our value: sell to them
-            cap = pos if reduce_only else SOFT_CAP + pos
-            vol = min(tb[1], TAKE_SIZE, max(0, cap))
-            if vol >= 1:
+        if tb and tb[0] - r >= need:                                    # someone bids above our value: sell to them
+            resting = self.my[iid]["ask"]["vol"] if self.my[iid]["ask"] else 0
+            vol = min(tb[1], TAKE_SIZE, max(0, pos if reduce_only else cap + pos - resting))
+            if vol >= 1 and self.insert(iid, tb[0], vol, "ask", "ioc") is not None:
                 self.last_take[iid] = now
-                self.insert(iid, tb[0], vol, "ask", "ioc")
-        elif ta and ta[0] < b["wa"] and r - ta[0] >= TAKE_EDGE:         # someone offers below our value: buy from them
-            cap = -pos if reduce_only else SOFT_CAP - pos
-            vol = min(ta[1], TAKE_SIZE, max(0, cap))
-            if vol >= 1:
+                self.n_takes += 1
+        elif ta and r - ta[0] >= need:                                  # someone offers below our value: buy from them
+            resting = self.my[iid]["bid"]["vol"] if self.my[iid]["bid"] else 0
+            vol = min(ta[1], TAKE_SIZE, max(0, -pos if reduce_only else cap - pos - resting))
+            if vol >= 1 and self.insert(iid, ta[0], vol, "bid", "ioc") is not None:
                 self.last_take[iid] = now
-                self.insert(iid, ta[0], vol, "bid", "ioc")
+                self.n_takes += 1
 
     def cut(self, iid, b, target_abs, now):
         """Bounded IOC that brings |position| down to target_abs. Waits 1 s for the position to update."""
@@ -350,14 +416,10 @@ class Bot:
         elif iid in self.fair and now - self.fair_at[iid] < 10:
             bound = math.floor(self.fair[iid]) - 8 if pos > 0 else math.ceil(self.fair[iid]) + 8
         else:
-            print(f"CUT {iid}: no reference price, position {pos} left open")
+            print(f"CUT {iid}: no reference price, position {pos} left open", flush=True)
             return
         self.last_cut[iid] = (now, pos)
         self.insert(iid, bound, vol, "ask" if pos > 0 else "bid", "ioc")
-
-    def pull(self, iid):
-        for side in ("bid", "ask"):
-            self.cancel(iid, side)
 
     # ----------------------------------------------------------------- one pass over all stocks
     def step(self):
@@ -369,23 +431,27 @@ class Bot:
             self.reconcile_positions()
             if self.pnl < -MAX_LOSS and not self.halted:
                 self.halted = True
-                print(f"KILL SWITCH: PnL {self.pnl:.1f} below -{MAX_LOSS}. Flattening and stopping.")
+                print(f"KILL SWITCH: PnL {self.pnl:.1f} below -{MAX_LOSS}. Flattening and stopping.", flush=True)
         flatten = self.halted or left < FLATTEN_S
         reduce_only = left < REDUCE_ONLY_S
         deletes, inserts = [], []
-        books = {}
         for iid in self.iids:
+            now = time.time()                             # order actions above may have taken time
             if now - self.last_ord_recon[iid] > RECONCILE_ORD_S:
                 self.reconcile_orders(iid)
-            b = books[iid] = self.read(iid, now)
+            b = self.read(iid, now)
             if b is None:
                 self.walls_bad_since.setdefault(iid, now)
             else:
                 self.walls_bad_since.pop(iid, None)
             pos = self.pos[iid]
             if flatten or abs(pos) >= HARD_CAP:
-                self.pull(iid)
-                self.cut(iid, b, 0 if flatten else SOFT_CAP // 2, now)
+                if self.my[iid]["bid"] or self.my[iid]["ask"] or now - self.last_force_pull.get(iid, 0) > 1.0:
+                    self.pace()
+                    self.ex.delete_orders(iid)            # also removes any order we lost track of
+                    self.my[iid] = {"bid": None, "ask": None}
+                    self.last_force_pull[iid] = now
+                self.cut(iid, b, 0 if flatten else self.soft_cap(iid) // 2, now)
                 continue
             if b is None:                                 # walls unreadable: keep quotes briefly, then pull
                 if now - self.walls_bad_since[iid] > WALL_GRACE_S:
@@ -394,14 +460,18 @@ class Bot:
             if now < self.pause_until[iid]:               # fair is moving fast: stand aside
                 self.pull(iid)
                 continue
-            bid, bsz, ask, asz, r = self.targets(iid, b, reduce_only)
+            r = self.reservation(iid, b)
             self.take(iid, b, r, now, reduce_only)
+            if self.in_blackout(iid, now):                # the walls may move now: nothing of ours may rest
+                self.pull(iid)
+                continue
+            bid, bsz, ask, asz = self.targets(iid, b, r, reduce_only)
             self.manage_side(iid, "bid", bid, bsz, now, deletes, inserts)
             self.manage_side(iid, "ask", ask, asz, now, deletes, inserts)
         for _, iid, side in sorted(deletes):              # stale quotes first, across all stocks
             self.cancel(iid, side)
         for iid, side, px, size in inserts:
-            if self.my[iid][side] is None:
+            if self.my[iid][side] is None and not self.in_blackout(iid, time.time()):
                 self.insert(iid, px, size, side)
         self.report(now, left)
 
@@ -413,8 +483,9 @@ class Bot:
             run = max(1.0, now - self.t0)
             edge = self.edge_sum / self.lots if self.lots else 0.0
             pos = " ".join(f"{i}:{self.pos[i]:+d}" for i in self.iids)
-            print(f"[{left:6.0f}s left] pnl {self.pnl:8.1f} dd {self.max_dd:6.1f} | fills {self.n_fills} lots {self.lots} "
-                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} | {pos}", flush=True)
+            mode = "HALTED" if self.halted else "FLATTEN" if left < FLATTEN_S else "REDUCE" if left < REDUCE_ONLY_S else "ACTIVE"
+            print(f"[{left:5.0f}s {mode}] pnl {self.pnl:8.1f} dd {self.max_dd:6.1f} | fills {self.n_fills} lots {self.lots} takes {self.n_takes} "
+                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} clocks {len(self.phase)} | {pos}", flush=True)
             self.fills_f.flush()
             self.state_f.flush()
             self.last_print = now
@@ -424,12 +495,15 @@ class Bot:
         t = time.time()
         for _ in range(50):
             self.ex.get_last_price_book(self.iids[0])
-        print(f"get_last_price_book takes {(time.time() - t) / 50 * 1000:.2f} ms per call "
-              f"(well under 1 ms means it is a local read; several ms means every read is a network request -> raise LOOP_SLEEP)")
+        ms = (time.time() - t) / 50 * 1000
+        print(f"get_last_price_book takes {ms:.2f} ms per call (well under 1 ms = local read; several ms = network request)")
+        if ms > 3:
+            self.loop_sleep = max(self.loop_sleep, 0.2)
+            print(f"book reads are slow -> loop sleep raised to {self.loop_sleep} s")
         self.reconcile_positions()
         for iid in self.iids:
             self.reconcile_orders(iid)
-        print(f"start positions: {self.pos}")
+        print(f"start positions: {self.pos}  (PnL is shown relative to the start of this run)", flush=True)
         try:
             while True:
                 if not self.ex.is_connected():
@@ -438,10 +512,8 @@ class Bot:
                     break
                 try:
                     self.step()
-                except SystemExit:
-                    raise
                 except Exception as e:                    # never die mid-session; state is re-read on the next pass
-                    print(f"ERROR in step: {e!r}")
+                    print(f"ERROR in step: {e!r}", flush=True)
                     self.last_pos_recon = 0.0
                     self.last_ord_recon = {i: 0.0 for i in self.iids}
                     time.sleep(0.2)
@@ -459,9 +531,10 @@ class Bot:
             edge = self.edge_sum / self.lots if self.lots else 0.0
             print("\n==== SESSION SUMMARY ====")
             print(f"PnL at fair value {self.pnl:.1f} | max drawdown {self.max_dd:.1f} | fills {self.n_fills} | lots {self.lots} "
-                  f"| average edge {edge:+.2f} ticks per lot | order actions {self.n_actions} | failures {self.n_fail}")
+                  f"| takes {self.n_takes} | average edge {edge:+.2f} ticks per lot | order actions {self.n_actions} | failures {self.n_fail}")
             print(f"final positions {self.pos}")
             print(f"largest |position| per stock {self.max_pos}")
+            print(f"learned clock phases {({k: round(v, 3) for k, v in self.phase.items()})}", flush=True)
             self.fills_f.close()
             self.state_f.close()
 
