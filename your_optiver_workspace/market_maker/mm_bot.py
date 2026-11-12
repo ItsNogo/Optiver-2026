@@ -42,8 +42,8 @@ from optibook.synchronous_client import Exchange
 
 # --------------------------------------------------------------------------- parameters
 POSITION_LIMIT = 100                 # exchange limit per instrument [challenge slides]
-SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 60   # passive fills and takes never push |position| above this
-HARD_CAP = 80                        # if |position| ever gets here: cut to half the soft cap with a bounded IOC
+SOFT_CAP_NARROW, SOFT_CAP_WIDE = 40, 80   # passive fills and takes never push |position| above this
+HARD_CAP = 95                        # if |position| ever gets here: cut to half the soft cap with a bounded IOC
 QUOTE_SIZE = 20                      # the organizers' taker sends 20-lot orders
 MIN_SIZE = 2                         # do not bother quoting less than this
 
@@ -54,12 +54,12 @@ PASSIVE_OFF = {"AVGO", "AMD", "NVDA"}   # no resting quotes here: the first live
 REFILL_S = 1.5                       # after one of our quotes is filled, do not re-quote that side for this long
 # Lead-lag: the follower's walls copy the leader's move about 3 s later (corr ~0.94 on 3 s windows after the restart).
 # follower: (leader, follower ticks per leader tick)
-LEADS = {"NBIS": ("AVGO", 0.22), "CRWV": ("MU", 0.95), "SNDK": ("NVDA", 0.40)}
+LEADS = {"NBIS": ("AVGO", 0.22), "CRWV": ("MU", 0.95), "SNDK": ("NVDA", 0.45)}
 LL_LEAK = 0.15                       # ticks per second by which an unpaid expected move fades
 LL_TIMEOUT = 7.0                     # seconds after which a move the follower still has not made is forgotten
 LL_MIN, LL_CAP = 1.5, 30.0           # expected move that counts as a signal / largest we believe, in ticks
 LL_WALL_EDGE = 2.0                   # take the follower's wall itself when the expected move beats it by this much
-LL_TAKE_SIZE = 40                    # lots per take when the expected move is at least 4 ticks
+LL_TAKE_SIZE = 80                    # lots per take when the expected move is at least 4 ticks
 SKEW_LIN, SKEW_CUB = 1.0, 1.0        # reservation price = fair - (LIN*x + CUB*x^3) ticks, x = inventory / soft cap
 PENNY = True                         # improve the best competing quote by one tick when the minimum edge allows it
 COMP_VOL = 5                         # a competing level only counts once this many lots rest at or better than it
@@ -74,7 +74,7 @@ PHASE_MIN_SAMPLES, PHASE_MIN_R = 8, 0.6   # how sure we must be of a stock's clo
 
 MAX_WALL_SPREAD = 30                 # ticks; wider than this is not a believable pair of walls
 MAX_JUMP = 12                        # ticks; a larger fair-value jump must persist JUMP_CONFIRM_S before we believe it
-JUMP_CONFIRM_S = 0.5
+JUMP_CONFIRM_S = 0.15
 WALL_GRACE_S = 0.4                   # keep quotes this long while the walls are unreadable
 VOL_PAUSE_TICKS = 4.0                # fair moved this much within VOL_WINDOW_S -> stand aside for VOL_PAUSE_S
 VOL_WINDOW_S, VOL_PAUSE_S = 2.0, 1.0
@@ -85,8 +85,8 @@ MIN_REQUOTE_S = 0.4                  # a quote that is still acceptable is not m
 RECONCILE_POS_S = 1.0                # re-read positions and cash from the exchange this often
 RECONCILE_ORD_S = 3.0                # re-read our resting orders per stock this often
 
-REDUCE_ONLY_S = 120                  # last seconds: only quotes and takes that reduce inventory
-FLATTEN_S = 45                       # last seconds: pull quotes and close positions with bounded IOCs
+REDUCE_ONLY_S = 60                   # last seconds: only quotes and takes that reduce inventory
+FLATTEN_S = 30                       # last seconds: pull quotes and close positions with bounded IOCs
 CUT_SLIP = 2                         # ticks through the wall a closing IOC may be priced
 MAX_LOSS = 800.0                     # PnL since start (at fair value) below minus this: flatten everything and stop
 STALE_BOOK_S = 5.0                   # a book whose timestamp has not changed for this long is not trusted
@@ -149,11 +149,14 @@ class Bot:
         self.max_pos = {i: 0 for i in self.iids}
         self.t0 = time.time()
         self.last_print = self.last_state = 0.0
-        self.fills_f = open("mm_fills.csv", "a", newline="")
-        self.state_f = open("mm_state.csv", "a", newline="")
+        stamp = utc_now().strftime("%H%M%S")
+        self.fills_f = open(f"mm_fills_{stamp}.csv", "w", newline="")
+        self.state_f = open(f"mm_state_{stamp}.csv", "w", newline="")
+        print(f"logs: mm_fills_{stamp}.csv, mm_state_{stamp}.csv")
+        self.feed_ok, self.last_feed = True, 0.0
         self.fills_w, self.state_w = csv.writer(self.fills_f), csv.writer(self.state_f)
         self.fills_w.writerow(["utc", "instrument", "side", "price", "volume", "fair_ticks", "edge_ticks", "position", "trade_id"])
-        self.state_w.writerow(["utc", "pnl", "max_drawdown"] + self.iids)
+        self.state_w.writerow(["utc", "pnl", "max_drawdown"] + self.iids + ["fair_" + i for i in self.iids] + ["lead_" + i for i in self.iids])
 
     def soft_cap(self, iid):
         return SOFT_CAP_WIDE if self.wide[iid] else SOFT_CAP_NARROW
@@ -526,9 +529,27 @@ class Bot:
                 self.insert(iid, px, size, side)
         self.report(now, left)
 
+    def show_feed(self, now):
+        """Print social-media posts so we can see afterwards whether they precede the jumps. No trading effect."""
+        if not self.feed_ok or now - self.last_feed < 0.5:
+            return
+        self.last_feed = now
+        try:
+            t = time.time()
+            posts = self.ex.poll_new_social_media_feeds()
+            if time.time() - t > 0.05:
+                self.feed_ok = False                      # too slow to call inside the loop
+            for post in posts or []:
+                print(f"FEED {utc_now():%H:%M:%S} {getattr(post, 'post', post)!s:.200}", flush=True)
+        except Exception as e:
+            self.feed_ok = False
+            print(f"feed disabled: {e!r}", flush=True)
+
     def report(self, now, left):
+        self.show_feed(now)
         if now - self.last_state > 1.0:
-            self.state_w.writerow([utc_now().isoformat(), round(self.pnl, 2), round(self.max_dd, 2)] + [self.pos[i] for i in self.iids])
+            self.state_w.writerow([utc_now().isoformat(), round(self.pnl, 2), round(self.max_dd, 2)] + [self.pos[i] for i in self.iids]
+                                  + [self.fair.get(i) for i in self.iids] + [round(self.debt.get(i, 0.0), 2) for i in self.iids])
             self.last_state = now
         if now - self.last_print > 5.0:
             run = max(1.0, now - self.t0)

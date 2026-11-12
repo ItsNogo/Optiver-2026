@@ -136,6 +136,21 @@ MIN_EDGE = {"AMD": 0.5, "AVGO": 0.5, "MU": 0.5, "VRT": 0.5, "NVDA": 1.0, "CRWV":
 # Stale-quote takes: only where they paid after costs. NVDA, SNDK, MU, VRT: no takes (SNDK only after a leader jump).
 TAKE_EDGE = {"AMD": 1.0, "AVGO": 1.0, "NBIS": 1.5, "CRWV": 2.0}
 
+# ---- REQUEST BUDGET. The exchange disconnects a client that exceeds its requests-per-second limit (it did so
+# at roughly 20-25 requests a second). Every request the bot sends is counted in budget(); nothing is sent that
+# would make more than MAX_REQ_PER_S in any rolling second. Raise it with --rate only after a clean test run.
+MAX_REQ_PER_S = 12
+# Stocks we quote and take in. All others are only watched (a leader must be watched for its follower's model).
+# The two narrow stocks cost 3 requests a second each (pull + two re-quotes); the followers are quoted without
+# the every-second pull and re-priced from their leader instead.
+TRADE = {"AVGO", "MU", "NBIS", "CRWV", "SNDK"}
+LEADER_BLACKOUT = False              # followers are not pulled every second (too many requests) ...
+MIN_EDGE.update({"CRWV": 2.0, "NBIS": 2.0, "SNDK": 2.0})   # ... so they quote 2 ticks from value, out of the snipers' usual reach
+SOFT_CAP_NARROW, SOFT_CAP_WIDE = 30, 40
+TAKE_SIZE = 10
+TAKE_WALL_SIZE = 20
+RECONCILE_POS_S, RECONCILE_ORD_S = 2.0, 10.0
+
 logging.getLogger("client").setLevel("ERROR")
 
 
@@ -182,6 +197,9 @@ class Bot:
         self.last_ord_recon = {i: 0.0 for i in self.iids}
         self.last_pos_recon = 0.0
         self.last_action = 0.0
+        self.req_times = deque()                           # send times of our recent requests
+        self.max_req = 0                                   # most requests seen in one rolling second
+        self.trade = {i for i in self.iids if i in TRADE}
         self.action_gap, self.loop_sleep = ACTION_GAP, LOOP_SLEEP
         self.halted = False
         self.pnl = self.peak = self.max_dd = 0.0
@@ -203,6 +221,20 @@ class Bot:
         return SOFT_CAP_WIDE if self.wide[iid] else SOFT_CAP_NARROW
 
     # ----------------------------------------------------------------- exchange calls
+    def budget(self, wait=True):
+        """Every request to the exchange passes through here: at most MAX_REQ_PER_S in any rolling second."""
+        q = self.req_times
+        while True:
+            now = time.time()
+            while q and now - q[0] > 1.05:
+                q.popleft()
+            reserve = sum(1 for i in self.trade if i in NARROW_SET) if TICK_AWARE and SCHEDULED_PULL else 0
+            if not wait or len(q) < max(1, MAX_REQ_PER_S - reserve):   # keep room for the scheduled pulls
+                break
+            time.sleep(max(0.005, q[0] + 1.06 - now))
+        q.append(time.time())
+        self.max_req = max(self.max_req, len(q))
+
     def tick_phase(self):
         """Fraction of the LOCAL second at which the narrow walls reprice (followers: 0.5 s later). None if unknown."""
         known = [self.phase[i] for i in self.iids if i in NARROW_SET and i in self.phase]
@@ -229,6 +261,7 @@ class Bot:
         for iid in self.iids:
             mine = self.my[iid]
             if (mine["bid"] or mine["ask"]) and (LEADER_BLACKOUT or iid not in WIDE_SET):
+                self.budget(wait=False)                    # a pull is never delayed; it is counted
                 self.ex.delete_orders(iid)
                 mine["bid"] = mine["ask"] = None
                 self.n_actions += 1
@@ -240,6 +273,7 @@ class Bot:
         wait = self.last_action + self.action_gap - time.time()
         if wait > 0:
             time.sleep(wait)
+        self.budget()
         self.last_action = time.time()
         self.n_actions += 1
 
@@ -317,6 +351,7 @@ class Bot:
     def reconcile_positions(self):
         for iid in self.iids:
             self.poll_fills(iid)                          # drain first so a fill is not counted twice
+        self.budget()
         pc = self.ex.get_positions_and_cash()
         total, complete = 0.0, True
         for iid in self.iids:
@@ -338,6 +373,7 @@ class Bot:
     def reconcile_orders(self, iid):
         """Make the local picture of our resting orders match the exchange. Keeps at most one per side."""
         tick, seen = self.tick[iid], {"bid": None, "ask": None}
+        self.budget()
         for o in self.ex.get_outstanding_orders(iid).values():
             if seen[o.side] is None:
                 old = self.my[iid][o.side]
@@ -599,7 +635,7 @@ class Bot:
         deletes, inserts = [], []
         for iid in self.iids:
             now = time.time()                             # order actions above may have taken time
-            if now - self.last_ord_recon[iid] > RECONCILE_ORD_S and not self.in_blackout(iid, now):
+            if iid in self.trade and now - self.last_ord_recon[iid] > RECONCILE_ORD_S and not self.in_blackout(iid, now):
                 self.reconcile_orders(iid)
             b = self.read(iid, now)
             if b is None:
@@ -607,6 +643,10 @@ class Bot:
             else:
                 self.walls_bad_since.pop(iid, None)
             pos = self.pos[iid]
+            if iid not in self.trade and not flatten:     # watched only: hold nothing in it
+                if pos != 0:
+                    self.cut(iid, b, 0, now)
+                continue
             if flatten or abs(pos) >= HARD_CAP:
                 if self.my[iid]["bid"] or self.my[iid]["ask"] or now - self.last_force_pull.get(iid, 0) > 1.0:
                     self.pace()
@@ -647,7 +687,7 @@ class Bot:
             pos = " ".join(f"{i}:{self.pos[i]:+d}" for i in self.iids)
             mode = "HALTED" if self.halted else "FLATTEN" if left < FLATTEN_S else "REDUCE" if left < REDUCE_ONLY_S else "ACTIVE"
             print(f"[{left:5.0f}s {mode}] pnl {self.pnl:8.1f} dd {self.max_dd:6.1f} | fills {self.n_fills} lots {self.lots} takes {self.n_takes} "
-                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} clocks {len(self.phase)} | {pos}", flush=True)
+                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} clocks {len(self.phase)} maxreq/s {self.max_req} | {pos}", flush=True)
             self.fills_f.flush()
             self.state_f.flush()
             self.last_print = now
@@ -666,6 +706,11 @@ class Bot:
         for iid in self.iids:
             self.reconcile_orders(iid)
         print(f"start positions: {self.pos}  (PnL is shown relative to the start of this run)", flush=True)
+        print(f"trading {sorted(self.trade)}; watching only {sorted(set(self.iids) - self.trade)}; at most {MAX_REQ_PER_S} requests per second", flush=True)
+        for iid in self.iids:
+            bk = self.ex.get_last_price_book(iid)
+            show = lambda lv: " ".join(f"{l.price:.1f}x{l.volume}" for l in (lv or [])[:5])
+            print(f"  {iid}: bids {show(bk.bids) if bk else None} | asks {show(bk.asks) if bk else None}", flush=True)
         try:
             while True:
                 if not self.ex.is_connected():
@@ -683,6 +728,7 @@ class Bot:
         finally:
             for iid in self.iids:
                 try:
+                    self.budget()
                     self.ex.delete_orders(iid)
                 except Exception:
                     pass
@@ -705,7 +751,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=None, help="run for this many minutes from now")
     ap.add_argument("--end", type=str, default=None, help="stop at this UTC time, HH:MM or HH:MM:SS (restart-safe)")
-    ap.add_argument("--only", type=str, default=None, help="comma-separated instruments to trade")
+    ap.add_argument("--only", type=str, default=None, help="comma-separated instruments to read at all")
+    ap.add_argument("--trade", type=str, default=None, help="comma-separated instruments to quote and take in (default: TRADE)")
+    ap.add_argument("--rate", type=int, default=None, help="maximum requests per second (default: MAX_REQ_PER_S)")
     a = ap.parse_args()
     now = utc_now()
     if a.end:
@@ -722,6 +770,11 @@ def main():
     ex.connect()
     if not ex.is_connected():
         raise SystemExit("not connected")
+    global MAX_REQ_PER_S, TRADE
+    if a.rate:
+        MAX_REQ_PER_S = max(3, a.rate)
+    if a.trade:
+        TRADE = set(a.trade.split(","))
     Bot(ex, end.timestamp(), set(a.only.split(",")) if a.only else None).run()
 
 
