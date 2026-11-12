@@ -129,7 +129,7 @@ WIDE_SET = {"CRWV", "NBIS", "SNDK"}
 EXCH_PHASE = 0.003
 SCHEDULED_PULL = True                # pull every quote in one burst shortly before that instant
 PULL_LEAD = 0.16                     # seconds before the instant at which the burst starts
-BURST_GAP = 0.005                    # seconds between the pulls of the burst
+BURST_GAP = 0.01                     # seconds between the pulls of the burst
 POST_NARROW, POST_FOLLOWER = 0.05, 0.105   # seconds after the instant before narrow / follower stocks are quoted again
 # Minimum ticks between our quote and our value. Measured: fills closer than this lose after 30 s.
 MIN_EDGE = {"AMD": 0.5, "AVGO": 0.5, "MU": 0.5, "VRT": 0.5, "NVDA": 1.0, "CRWV": 1.0, "NBIS": 1.0, "SNDK": 1.0}
@@ -205,10 +205,12 @@ class Bot:
     # ----------------------------------------------------------------- exchange calls
     def tick_phase(self):
         """Fraction of the LOCAL second at which the narrow walls reprice (followers: 0.5 s later). None if unknown."""
-        if len(self.lag) >= 40:
-            return (EXCH_PHASE + min(self.lag)) % 1.0      # smallest lag seen = clock offset plus the feed delay
         known = [self.phase[i] for i in self.iids if i in NARROW_SET and i in self.phase]
-        return known[0] if known else None
+        if len(self.lag) >= 40:
+            ph = (EXCH_PHASE + min(self.lag)) % 1.0        # smallest lag seen = clock offset plus the feed delay
+            if not known or abs((ph - known[0] + 0.5) % 1.0 - 0.5) < 0.15:
+                return ph                                  # agrees with what the walls were seen to do: use it
+        return known[0] if known else None                 # book timestamps are not the exchange clock: trust the walls
 
     def guard(self):
         """Pull every resting quote in one burst just before the walls can move. Runs before each action and pass."""
@@ -354,15 +356,15 @@ class Bot:
         if not book or not book.bids or not book.asks:
             return None
         ts = getattr(book, "timestamp", None)
-        if ts is not None:
-            try:
-                self.lag.append(now - (ts.timestamp() if hasattr(ts, "timestamp") else float(ts)))
-            except Exception:
-                pass
         seen = self.book_seen.get(iid)
         if seen is None or seen[0] != ts:
             self.book_seen[iid] = (ts, now)
-        elif now - seen[1] > STALE_BOOK_S:
+            if ts is not None:                             # a book we have not seen before: one clock-offset sample
+                try:
+                    self.lag.append(now - (ts.timestamp() if hasattr(ts, "timestamp") else float(ts)))
+                except Exception:
+                    pass
+        elif ts is not None and now - seen[1] > STALE_BOOK_S:
             return None                                   # the feed for this stock has stalled
         tick, mine = self.tick[iid], self.my[iid]
         big_b = next((k for k, lv in enumerate(book.bids) if lv.volume >= WALL_BIG), None)
@@ -402,15 +404,18 @@ class Bot:
             if not cand or cand[0] != fair:
                 self.jump[iid] = (fair, now)
                 return None
-            if self.jump_rec.get(iid) != cand:              # same new value seen on two passes: tell the follower model now
-                self.jump_rec[iid] = cand
-                self.lead_moves[iid].append((cand[1], fair - last))
+            rec = self.jump_rec.get(iid)                    # same new value seen on two passes: tell the follower model now
+            if rec is None or rec[0] != cand:
+                already = rec[1] if rec and rec[2] == last else 0.0     # part of this jump recorded for an earlier candidate
+                self.jump_rec[iid] = (cand, fair - last, last)
+                self.lead_moves[iid].append((cand[1], fair - last - already))
             if now - cand[1] < JUMP_CONFIRM_S:
                 return None
         self.jump.pop(iid, None)
         if last is not None and fair != last and abs(fair - last) <= MAX_JUMP:
             self.learn_phase(iid, now)
-            self.lead_moves[iid].append((now, fair - last))
+            if now - self.fair_at.get(iid, 0) < 1.5:
+                self.lead_moves[iid].append((now, fair - last))
         self.wide[iid] = (iid in WIDE_SET) if iid in WIDE_SET or iid in NARROW_SET else wide
         self.fair[iid], self.fair_at[iid] = fair, now
         hist = self.fair_hist[iid]
@@ -545,15 +550,17 @@ class Bot:
         elif LEADLAG and TAKE_WALL and iid in LEADER and not reduce_only:
             d = self.drift(iid, now)                                    # the leader jumped: trade the follower's catch-up
             if d >= LEAD_MIN_DRIFT and r - b["wa"] >= TAKE_EDGE_WALL:
-                side, px, vol, own = "bid", b["wa"], min(TAKE_WALL_SIZE, cap - pos), "ask"
+                rest = self.my[iid]["bid"]["vol"] if self.my[iid]["bid"] else 0
+                side, px, vol, own = "bid", b["wa"], min(TAKE_WALL_SIZE, cap - pos - rest), "ask"
             elif d <= -LEAD_MIN_DRIFT and b["wb"] - r >= TAKE_EDGE_WALL:
-                side, px, vol, own = "ask", b["wb"], min(TAKE_WALL_SIZE, cap + pos), "bid"
+                rest = self.my[iid]["ask"]["vol"] if self.my[iid]["ask"] else 0
+                side, px, vol, own = "ask", b["wb"], min(TAKE_WALL_SIZE, cap + pos - rest), "bid"
             else:
                 return
             if vol >= 1:
                 self.cancel(iid, own)                                   # our own quote on that side would block the order
                 if self.insert(iid, px, vol, side, "ioc") is not None:
-                    self.last_take[iid] = now
+                    self.last_take[iid] = now + 0.75         # 1 s until the next take: let the fill reach our position first
                     self.n_takes += 1
                     self.n_wall_takes += 1
                     print(f"WALL TAKE {iid} {side} {vol}@{px} drift {d:+.1f}t pos {pos:+d}", flush=True)
@@ -592,7 +599,7 @@ class Bot:
         deletes, inserts = [], []
         for iid in self.iids:
             now = time.time()                             # order actions above may have taken time
-            if now - self.last_ord_recon[iid] > RECONCILE_ORD_S:
+            if now - self.last_ord_recon[iid] > RECONCILE_ORD_S and not self.in_blackout(iid, now):
                 self.reconcile_orders(iid)
             b = self.read(iid, now)
             if b is None:

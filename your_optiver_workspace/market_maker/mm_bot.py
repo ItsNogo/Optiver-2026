@@ -49,7 +49,17 @@ MIN_SIZE = 2                         # do not bother quoting less than this
 
 WALL_BIG, WALL_SMALL = 2500, 700     # innermost ladder level: >= 2500 lots (narrow stocks) else >= 700 (wide stocks)
 MIN_EDGE_NARROW = 0.5                # ticks between our quote and the inventory-adjusted fair value
-MIN_EDGE_WIDE = 2.0                  # wide stocks: at least this, and at least wall_spread/2 - 3
+MIN_EDGE_WIDE = 2.0                  # wide stocks: at least this many ticks from the adjusted fair value
+PASSIVE_OFF = {"AVGO", "AMD", "NVDA"}   # no resting quotes here: the first live run lost on them (takes still allowed)
+REFILL_S = 1.5                       # after one of our quotes is filled, do not re-quote that side for this long
+# Lead-lag: the follower's walls copy the leader's move about 3 s later (corr ~0.94 on 3 s windows after the restart).
+# follower: (leader, follower ticks per leader tick)
+LEADS = {"NBIS": ("AVGO", 0.22), "CRWV": ("MU", 0.95), "SNDK": ("NVDA", 0.40)}
+LL_LEAK = 0.15                       # ticks per second by which an unpaid expected move fades
+LL_TIMEOUT = 7.0                     # seconds after which a move the follower still has not made is forgotten
+LL_MIN, LL_CAP = 1.5, 30.0           # expected move that counts as a signal / largest we believe, in ticks
+LL_WALL_EDGE = 2.0                   # take the follower's wall itself when the expected move beats it by this much
+LL_TAKE_SIZE = 40                    # lots per take when the expected move is at least 4 ticks
 SKEW_LIN, SKEW_CUB = 1.0, 1.0        # reservation price = fair - (LIN*x + CUB*x^3) ticks, x = inventory / soft cap
 PENNY = True                         # improve the best competing quote by one tick when the minimum edge allows it
 COMP_VOL = 5                         # a competing level only counts once this many lots rest at or better than it
@@ -81,7 +91,7 @@ CUT_SLIP = 2                         # ticks through the wall a closing IOC may 
 MAX_LOSS = 800.0                     # PnL since start (at fair value) below minus this: flatten everything and stop
 STALE_BOOK_S = 5.0                   # a book whose timestamp has not changed for this long is not trusted
 # Correlated pairs (30 s correlation ~0.9+): a share of the partner's inventory counts as our own for the skew.
-USE_PAIRS = True
+USE_PAIRS = False
 PAIR_WEIGHT = {"AVGO": ("NBIS", 0.2), "NBIS": ("AVGO", 0.6), "CRWV": ("MU", 0.4), "MU": ("CRWV", 0.4)}
 
 logging.getLogger("client").setLevel("ERROR")
@@ -121,6 +131,9 @@ class Bot:
         self.walls_bad_since = {}
         self.last_take = {i: 0.0 for i in self.iids}
         self.last_cut = {}
+        self.debt = {b: 0.0 for b in LEADS}              # follower -> move it still owes its leader, in ticks
+        self.ll_prev, self.debt_since, self.ll_t = {}, {}, time.time()
+        self.side_block = {}                             # (iid, side) -> time until which that side is not re-quoted
         self.last_force_pull = {}
         self.last_ord_recon = {i: 0.0 for i in self.iids}
         self.last_pos_recon = 0.0
@@ -211,6 +224,7 @@ class Bot:
             self.pos[iid] += sign * t.volume
             o = self.my[iid][t.side]
             if o and o["id"] == t.order_id:
+                self.side_block[(iid, t.side)] = time.time() + REFILL_S
                 o["vol"] -= t.volume
                 if o["vol"] <= 0:
                     self.my[iid][t.side] = None
@@ -333,6 +347,26 @@ class Bot:
         else:
             self.phase.pop(iid, None)
 
+    def update_debts(self, now):
+        """Each leader move is 'owed' by its follower; the follower's own moves pay it back."""
+        dt, self.ll_t = now - self.ll_t, now
+        for b, (a, beta) in LEADS.items():
+            fa, fb = self.fair.get(a), self.fair.get(b)
+            if fa is None or fb is None:
+                continue
+            pa, pb = self.ll_prev.get(b, (fa, fb))
+            d = self.debt[b] + beta * (fa - pa) - (fb - pb)
+            d -= math.copysign(min(abs(d), LL_LEAK * dt), d)
+            d = max(-LL_CAP, min(LL_CAP, d))
+            if abs(d) >= LL_MIN:
+                if now - self.debt_since.setdefault(b, now) > LL_TIMEOUT:
+                    d = 0.0                               # the follower never moved: forget it
+                    self.debt_since.pop(b, None)
+            else:
+                self.debt_since.pop(b, None)
+            self.debt[b] = d
+            self.ll_prev[b] = (fa, fb)
+
     def in_blackout(self, iid, now):
         """True around the instant the walls of this (narrow) stock can move."""
         if not TICK_AWARE or self.wide[iid] or iid not in self.phase:
@@ -346,14 +380,16 @@ class Bot:
         if USE_PAIRS and iid in PAIR_WEIGHT and PAIR_WEIGHT[iid][0] in self.pos:
             p += PAIR_WEIGHT[iid][1] * self.pos[PAIR_WEIGHT[iid][0]]
         x = max(-1.5, min(1.5, p / self.soft_cap(iid)))
-        return b["fair"] - (SKEW_LIN * x + SKEW_CUB * x ** 3)
+        return b["fair"] + self.debt.get(iid, 0.0) - (SKEW_LIN * x + SKEW_CUB * x ** 3)
 
     def targets(self, iid, b, r, reduce_only):
         """-> (bid, bid_size, ask, ask_size) in ticks and lots."""
         pos, wb, wa, cap = self.pos[iid], b["wb"], b["wa"], self.soft_cap(iid)
-        edge = max(MIN_EDGE_WIDE, (wa - wb) / 2 - 3) if self.wide[iid] else MIN_EDGE_NARROW
+        edge = MIN_EDGE_WIDE if self.wide[iid] else MIN_EDGE_NARROW
         ask = math.ceil(r + edge - 1e-9)                               # closest to fair we are willing to sell
         bid = math.floor(r - edge + 1e-9)
+        no_ask, no_bid = ask > wa, bid < wb                            # our price would be behind the wall: do not quote
+        now = time.time()
         if PENNY:                                                      # do not give away more edge than needed
             ask = max(ask, (b["oa"] if b["oa"] is not None else wa) - 1)
             bid = min(bid, (b["ob"] if b["ob"] is not None else wb) + 1)
@@ -363,6 +399,12 @@ class Bot:
             bid = ask - 1
         bid_size = max(0, min(QUOTE_SIZE, cap - pos))
         ask_size = max(0, min(QUOTE_SIZE, cap + pos))
+        if iid in PASSIVE_OFF and not reduce_only:
+            bid_size = ask_size = 0
+        if no_bid or now < self.side_block.get((iid, "bid"), 0):
+            bid_size = 0
+        if no_ask or now < self.side_block.get((iid, "ask"), 0):
+            ask_size = 0
         if reduce_only:
             bid_size, ask_size = min(bid_size, max(0, -pos)), min(ask_size, max(0, pos))
         elif bid_size < MIN_SIZE or ask_size < MIN_SIZE:
@@ -391,15 +433,21 @@ class Bot:
         pos, cap = self.pos[iid], self.soft_cap(iid)
         need = TAKE_EDGE_WIDE if self.wide[iid] else TAKE_EDGE_NARROW
         tb, ta = b["tb"], b["ta"]
+        if iid in LEADS and not reduce_only:                            # follower: its wall is about to move
+            if (not ta or r - ta[0] < need) and r - b["wa"] >= LL_WALL_EDGE:
+                ta = (b["wa"], LL_TAKE_SIZE)
+            elif (not tb or tb[0] - r < need) and b["wb"] - r >= LL_WALL_EDGE:
+                tb = (b["wb"], LL_TAKE_SIZE)
+        big = LL_TAKE_SIZE if abs(self.debt.get(iid, 0.0)) >= 4 else TAKE_SIZE
         if tb and tb[0] - r >= need:                                    # someone bids above our value: sell to them
             resting = self.my[iid]["ask"]["vol"] if self.my[iid]["ask"] else 0
-            vol = min(tb[1], TAKE_SIZE, max(0, pos if reduce_only else cap + pos - resting))
+            vol = min(tb[1], big, max(0, pos if reduce_only else cap + pos - resting))
             if vol >= 1 and self.insert(iid, tb[0], vol, "ask", "ioc") is not None:
                 self.last_take[iid] = now
                 self.n_takes += 1
         elif ta and r - ta[0] >= need:                                  # someone offers below our value: buy from them
             resting = self.my[iid]["bid"]["vol"] if self.my[iid]["bid"] else 0
-            vol = min(ta[1], TAKE_SIZE, max(0, -pos if reduce_only else cap - pos - resting))
+            vol = min(ta[1], big, max(0, -pos if reduce_only else cap - pos - resting))
             if vol >= 1 and self.insert(iid, ta[0], vol, "bid", "ioc") is not None:
                 self.last_take[iid] = now
                 self.n_takes += 1
@@ -435,6 +483,9 @@ class Bot:
         flatten = self.halted or left < FLATTEN_S
         reduce_only = left < REDUCE_ONLY_S
         deletes, inserts = [], []
+        for iid in self.iids:                             # refresh every fair value before deciding anything
+            self.read(iid, now)
+        self.update_debts(now)
         for iid in self.iids:
             now = time.time()                             # order actions above may have taken time
             if now - self.last_ord_recon[iid] > RECONCILE_ORD_S:
@@ -485,7 +536,8 @@ class Bot:
             pos = " ".join(f"{i}:{self.pos[i]:+d}" for i in self.iids)
             mode = "HALTED" if self.halted else "FLATTEN" if left < FLATTEN_S else "REDUCE" if left < REDUCE_ONLY_S else "ACTIVE"
             print(f"[{left:5.0f}s {mode}] pnl {self.pnl:8.1f} dd {self.max_dd:6.1f} | fills {self.n_fills} lots {self.lots} takes {self.n_takes} "
-                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} clocks {len(self.phase)} | {pos}", flush=True)
+                  f"edge/lot {edge:+.2f}t | {self.n_actions / run:4.1f} act/s fails {self.n_fail} clocks {len(self.phase)} "
+                  f"lead {' '.join(f'{k}:{v:+.1f}' for k, v in self.debt.items())} | {pos}", flush=True)
             self.fills_f.flush()
             self.state_f.flush()
             self.last_print = now
