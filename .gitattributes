@@ -1,0 +1,2 @@
+bot_data/*.pkl filter=lfs diff=lfs merge=lfs -text
+bot_data/*.zip filter=lfs diff=lfs merge=lfs -text
